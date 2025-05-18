@@ -2,13 +2,12 @@ import React, { useState, useEffect, useContext, useRef } from 'react'
 import { UserContext } from '../context/user.context'
 import { useNavigate, useLocation } from 'react-router-dom'
 import axios from '../config/axios'
-import { initializeSocket, receiveMessage, sendMessage } from '../config/socket'
+import { initializeSocket, receiveMessage, sendMessage, disconnect } from '../config/socket'
 import Markdown from 'markdown-to-jsx'
 import hljs from 'highlight.js';
 import { getWebContainer } from '../config/webcontainer'
 import PropTypes from 'prop-types'
 
-// Add sanitizeJsonString helper function
 function sanitizeJsonString(jsonString) {
   if (typeof jsonString !== 'string') return jsonString;
   
@@ -19,30 +18,58 @@ function sanitizeJsonString(jsonString) {
     console.log("Attempting to sanitize JSON string...");
     
     try {
-      // Try to fix common JSON issues:
-      // 1. Replace unescaped backslashes in code blocks
-      const sanitized = jsonString
+      // More aggressive sanitization:
+      let sanitized = jsonString
+        // 1. Replace unescaped backslashes
         .replace(/([^\\])(\\)([^\\/"bfnrtu])/g, '$1\\\\$3')
-        // 2. Fix newlines in code blocks
+        // 2. Fix newlines
         .replace(/([^\\])\\n/g, '$1\\\\n')
-        // 3. Fix tabs in code blocks
-        .replace(/([^\\])\\t/g, '$1\\\\t');
+        // 3. Fix tabs
+        .replace(/([^\\])\\t/g, '$1\\\\t')
+        // 4. Add quotes around unquoted property names
+        .replace(/([{,]\s*)([a-zA-Z0-9_$]+)(\s*:)/g, '$1"$2"$3')
+        // 5. Fix trailing commas in objects/arrays
+        .replace(/,(\s*[}\]])/g, '$1');
+      
+      // Try to balance braces and brackets
+      let braceCount = 0, bracketCount = 0;
+      for (let i = 0; i < sanitized.length; i++) {
+        if (sanitized[i] === '{') braceCount++;
+        if (sanitized[i] === '}') braceCount--;
+        if (sanitized[i] === '[') bracketCount++;
+        if (sanitized[i] === ']') bracketCount--;
+      }
+      
+      // Add missing closing braces/brackets
+      while (braceCount > 0) {
+        sanitized += '}';
+        braceCount--;
+      }
+      while (bracketCount > 0) {
+        sanitized += ']';
+        bracketCount--;
+      }
       
       return JSON.parse(sanitized);
     } catch (secondError) {
       console.error("Failed to sanitize JSON:", secondError);
       
-      // Fall back to extracting just the text portion if possible
+      // Last resort: return a simple object with text
       try {
+        // Try to extract just text content
         const textMatch = jsonString.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (textMatch && textMatch[1]) {
           return { text: textMatch[1].replace(/\\"/g, '"') };
         }
+        
+        // If that fails, return a basic fallback response
+        return { 
+          text: "Error: Could not parse AI response. Please try again with a simpler request." 
+        };
       } catch (e) {
         console.error("Couldn't extract text from malformed JSON");
+        return { text: "Error processing AI response" };
       }
-      
-      throw secondError;
     }
   }
 }
@@ -70,17 +97,19 @@ SyntaxHighlightedCode.propTypes = {
 const Project = () => {
     const location = useLocation()
     const messageBox = useRef(null)
+    const socketRef = useRef(null)
 
     const [isSidePanelOpen, setIsSidePanelOpen] = useState(false)
     const [isModalOpen, setIsModalOpen] = useState(false)
-    const [selectedUserId, setSelectedUserId] = useState(new Set()) // Initialized as Set
+    const [selectedUserId, setSelectedUserId] = useState(new Set())
     const [project, setProject] = useState(location.state?.project || {})
     const [message, setMessage] = useState('')
     const { user } = useContext(UserContext)
 
     const [users, setUsers] = useState([])
-    const [messages, setMessages] = useState([]) // New state variable for messages
+    const [messages, setMessages] = useState([])
     const [fileTree, setFileTree] = useState({})
+    const [socketError, setSocketError] = useState(null)
 
     const [currentFile, setCurrentFile] = useState(null)
     const [openFiles, setOpenFiles] = useState([])
@@ -103,13 +132,13 @@ const Project = () => {
     }
 
     function addCollaborators() {
-        if (!location.state?.project?._id) {
+        if (!project?._id) {
             console.error("Project ID missing");
             return;
         }
         
         axios.put("/projects/add-user", {
-            projectId: location.state.project._id,
+            projectId: project._id,
             users: Array.from(selectedUserId)
         }).then(res => {
             console.log(res.data)
@@ -122,48 +151,66 @@ const Project = () => {
     const send = () => {
         if (!message.trim()) return;
         
-        sendMessage('project-message', {
+        const success = sendMessage('project-message', {
             message,
             sender: user
-        })
-        setMessages(prevMessages => [...prevMessages, { sender: user, message }]) // Update messages state
-        setMessage("")
-    }
-
-    // Updated WriteAiMessage function to use sanitizeJsonString
-    function WriteAiMessage(message) {
-        try {
-            const messageObject = sanitizeJsonString(message)
-            return (
-                <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
-                    <Markdown
-                        options={{
-                            overrides: {
-                                code: SyntaxHighlightedCode,
-                            },
-                        }}
-                    >
-                        {messageObject.text || "No content"}
-                    </Markdown>
-                </div>
-            )
-        } catch (error) {
-            console.error("JSON parse error:", error);
-            return (
-                <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
-                    <p>Failed to parse message: {typeof message === 'string' ? message.substring(0, 50) + '...' : 'Invalid message format'}</p>
-                </div>
-            );
+        });
+        
+        if (success) {
+            setMessages(prevMessages => [...prevMessages, { sender: user, message }])
+            setMessage("")
+        } else {
+            setSocketError("Failed to send message. Connection might be lost.")
+            
+            // Try to reconnect socket
+            socketRef.current = initializeSocket(project._id)
         }
     }
 
+   function WriteAiMessage(message) {
+    try {
+        const messageObject = sanitizeJsonString(message);
+        return (
+            <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
+                <Markdown
+                    options={{
+                        overrides: {
+                            code: SyntaxHighlightedCode,
+                        },
+                    }}
+                >
+                    {messageObject?.text || "No content"}
+                </Markdown>
+            </div>
+        );
+    } catch (error) {
+        console.error("JSON parse error:", error);
+        // Fallback to raw message display with length limit
+        return (
+            <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
+                <p>Failed to parse message: {
+                    typeof message === 'string' 
+                    ? (message.length > 100 ? message.substring(0, 100) + '...' : message) 
+                    : 'Invalid message format'
+                }</p>
+            </div>
+        );
+    }
+}
+
     useEffect(() => {
-        if (!location.state?.project?._id) {
+        if (!project?._id) {
             console.error("Project ID missing");
             return;
         }
 
-        initializeSocket(project._id)
+        // Initialize socket with better error handling
+        socketRef.current = initializeSocket(project._id);
+        
+        if (!socketRef.current) {
+            setSocketError("Failed to initialize socket connection. Project ID may be invalid.");
+            return;
+        }
 
         if (!webContainer) {
             getWebContainer().then(container => {
@@ -202,7 +249,7 @@ const Project = () => {
             }
         })
 
-        axios.get(`/projects/get-project/${location.state.project._id}`).then(res => {
+        axios.get(`/projects/get-project/${project._id}`).then(res => {
             console.log(res.data.project)
             setProject(res.data.project)
             setFileTree(res.data.project.fileTree || {})
@@ -216,7 +263,11 @@ const Project = () => {
             console.log(err)
         })
 
-    }, [])
+        // Cleanup function
+        return () => {
+            disconnect();
+        };
+    }, [project._id])
 
     // Scroll to bottom when messages change
     useEffect(() => {
@@ -245,6 +296,15 @@ const Project = () => {
         }
     }
 
+    // Retry socket connection function
+    const retryConnection = () => {
+        setSocketError(null);
+        socketRef.current = initializeSocket(project._id);
+        if (socketRef.current) {
+            alert("Attempting to reconnect...");
+        }
+    }
+
     return (
         <main className='h-screen w-screen flex'>
             <section className="left relative flex flex-col h-screen min-w-96 bg-slate-300">
@@ -258,6 +318,13 @@ const Project = () => {
                     </button>
                 </header>
                 <div className="conversation-area pt-14 pb-10 flex-grow flex flex-col h-full relative">
+                    {socketError && (
+                        <div className="socket-error bg-red-100 border-l-4 border-red-500 text-red-700 p-3 mb-2 flex justify-between">
+                            <p>{socketError}</p>
+                            <button onClick={retryConnection} className="underline">Retry</button>
+                        </div>
+                    )}
+                    
                     <div
                         ref={messageBox}
                         className="message-box p-1 flex-grow flex flex-col gap-1 overflow-auto max-h-full scrollbar-hide">
@@ -311,7 +378,7 @@ const Project = () => {
                 </div>
             </section>
 
-            <section className="right  bg-red-50 flex-grow h-full flex">
+            <section className="right bg-red-50 flex-grow h-full flex">
                 <div className="explorer h-full max-w-64 min-w-52 bg-slate-200">
                     <div className="file-tree w-full">
                         {
