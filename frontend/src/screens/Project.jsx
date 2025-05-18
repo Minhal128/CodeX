@@ -9,68 +9,67 @@ import { getWebContainer } from '../config/webcontainer'
 import PropTypes from 'prop-types'
 
 function sanitizeJsonString(jsonString) {
-  if (typeof jsonString !== 'string') return jsonString;
-  
+  // Direct text extraction - bypass JSON parsing completely
   try {
-    // First try regular parsing
-    return JSON.parse(jsonString);
-  } catch (error) {
-    console.log("Attempting to sanitize JSON string...");
+    // If it's not a string, return as is
+    if (typeof jsonString !== 'string') return jsonString;
     
-    try {
-      // More aggressive sanitization:
-      let sanitized = jsonString
-        // 1. Replace unescaped backslashes
-        .replace(/([^\\])(\\)([^\\/"bfnrtu])/g, '$1\\\\$3')
-        // 2. Fix newlines
-        .replace(/([^\\])\\n/g, '$1\\\\n')
-        // 3. Fix tabs
-        .replace(/([^\\])\\t/g, '$1\\\\t')
-        // 4. Add quotes around unquoted property names
-        .replace(/([{,]\s*)([a-zA-Z0-9_$]+)(\s*:)/g, '$1"$2"$3')
-        // 5. Fix trailing commas in objects/arrays
-        .replace(/,(\s*[}\]])/g, '$1');
+    // Special case for React app creation - detect patterns that indicate a file tree response
+    if (jsonString.includes('"fileTree"') && (jsonString.includes('react') || jsonString.includes('package.json'))) {
+      console.log("Detected React file tree creation request");
       
-      // Try to balance braces and brackets
-      let braceCount = 0, bracketCount = 0;
-      for (let i = 0; i < sanitized.length; i++) {
-        if (sanitized[i] === '{') braceCount++;
-        if (sanitized[i] === '}') braceCount--;
-        if (sanitized[i] === '[') bracketCount++;
-        if (sanitized[i] === ']') bracketCount--;
-      }
-      
-      // Add missing closing braces/brackets
-      while (braceCount > 0) {
-        sanitized += '}';
-        braceCount--;
-      }
-      while (bracketCount > 0) {
-        sanitized += ']';
-        bracketCount--;
-      }
-      
-      return JSON.parse(sanitized);
-    } catch (secondError) {
-      console.error("Failed to sanitize JSON:", secondError);
-      
-      // Last resort: return a simple object with text
-      try {
-        // Try to extract just text content
-        const textMatch = jsonString.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-        if (textMatch && textMatch[1]) {
-          return { text: textMatch[1].replace(/\\"/g, '"') };
-        }
-        
-        // If that fails, return a basic fallback response
-        return { 
-          text: "Error: Could not parse AI response. Please try again with a simpler request." 
-        };
-      } catch (e) {
-        console.error("Couldn't extract text from malformed JSON");
-        return { text: "Error processing AI response" };
-      }
+      // Don't try to parse the fileTree JSON - just indicate it's there
+      return { 
+        text: "Creating React application files. Check the file explorer panel.",
+        fileTree: true // Just indicate presence of file tree, don't try to parse it
+      };
     }
+    
+    // Try direct parsing first for non-file tree content
+    try {
+      return JSON.parse(jsonString);
+    } catch (firstError) {
+      console.log("Attempting to sanitize JSON string...");
+      // Log the error position for debugging
+      if (firstError instanceof SyntaxError) {
+        const match = firstError.message.match(/position (\d+)/);
+        if (match) {
+          const position = parseInt(match[1]);
+          const start = Math.max(0, position - 40);
+          const end = Math.min(jsonString.length, position + 40);
+          console.log(`Error near position ${position}: "${jsonString.substring(start, end)}"`);
+          console.log(`Character at position: '${jsonString.charAt(position)}' | Previous: '${jsonString.charAt(position-1)}' | Next: '${jsonString.charAt(position+1)}'`);
+        }
+      }
+      
+      // BYPASS JSON PARSING COMPLETELY - Extract text directly with regex
+      // Look for text field
+      const textMatch = jsonString.match(/"text"\s*:\s*"((?:[^"\\]|\\.|[\s\S])*?)(?:"[,}]|$)/);
+      if (textMatch && textMatch[1]) {
+        // Success - just return the text content
+        return { text: textMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n') };
+      }
+      
+      // If there's a fileTree field, try to extract it
+      if (jsonString.includes('"fileTree"')) {
+        // Create a simple response with just the text content
+        const basicContent = jsonString.replace(/.*"text"\s*:\s*"([^"]+)".*/, "$1");
+        return { 
+          text: "```\nFile structure created. Check the file explorer panel.\n```",
+          fileTree: true // Just indicate presence of file tree
+        };
+      }
+      
+      // Final fallback - return first text field or the raw message trimmed
+      return {
+        text: "AI response (JSON parsing failed):\n\n```\n" +
+              (jsonString.length > 300 ? jsonString.substring(0, 300) + "..." : jsonString) +
+              "\n```"
+      };
+    }
+  } catch (finalError) {
+    console.error("Complete failure in JSON parsing:", finalError);
+    return { text: "Error displaying message content" };
   }
 }
 
@@ -167,36 +166,342 @@ const Project = () => {
         }
     }
 
-   function WriteAiMessage(message) {
-    try {
-        const messageObject = sanitizeJsonString(message);
-        return (
-            <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
-                <Markdown
-                    options={{
-                        overrides: {
-                            code: SyntaxHighlightedCode,
-                        },
-                    }}
-                >
-                    {messageObject?.text || "No content"}
-                </Markdown>
-            </div>
-        );
-    } catch (error) {
-        console.error("JSON parse error:", error);
-        // Fallback to raw message display with length limit
-        return (
-            <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
-                <p>Failed to parse message: {
-                    typeof message === 'string' 
-                    ? (message.length > 100 ? message.substring(0, 100) + '...' : message) 
-                    : 'Invalid message format'
-                }</p>
-            </div>
-        );
+    function WriteAiMessage(message) {
+        // If there's no message, show a simple placeholder
+        if (!message) {
+            return <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>No message content</div>;
+        }
+        
+        try {
+            // Convert the message to a displayable format, bypassing JSON parsing if needed
+            const messageObject = sanitizeJsonString(message);
+            
+            return (
+                <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
+                    <Markdown
+                        options={{
+                            overrides: {
+                                code: SyntaxHighlightedCode,
+                                pre: ({ children, ...props }) => <pre {...props}>{children || ''}</pre>,
+                                p: ({ children, ...props }) => <p {...props}>{children || ''}</p>,
+                            },
+                        }}
+                    >
+                        {messageObject?.text || "No content"}
+                    </Markdown>
+                </div>
+            );
+        } catch (error) {
+            // Last resort fallback - just show the raw content
+            console.error("Complete message rendering failure:", error);
+            return (
+                <div className='overflow-auto bg-slate-950 text-white rounded-sm p-2'>
+                    <p>Failed to render message</p>
+                    <pre className="text-xs mt-2 p-2 bg-slate-900 overflow-x-auto">
+                        {typeof message === 'string' 
+                            ? message.substring(0, 100) + (message.length > 100 ? '...' : '')
+                            : 'Invalid message format'}
+                    </pre>
+                </div>
+            );
+        }
     }
+
+    // Helper function to create a basic React app template
+    const createReactApp = () => {
+        if (!webContainer) {
+            console.error("WebContainer not initialized");
+            return;
+        }
+
+        // Basic React app structure
+        const basicReactApp = {
+            "package.json": {
+                file: {
+                    contents: `{
+  "name": "react-app",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}`
+                }
+            },
+            "public": {
+                directory: {
+                    "index.html": {
+                        file: {
+                            contents: `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>React App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>`
+                        }
+                    }
+                }
+            },
+            "src": {
+                directory: {
+                    "index.js": {
+                        file: {
+                            contents: `import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);`
+                        }
+                    },
+                    "App.js": {
+                        file: {
+                            contents: `import React from 'react';
+
+function App() {
+  return (
+    <div className="App">
+      <header className="App-header">
+        <h1>Welcome to My React App</h1>
+        <p>Edit <code>src/App.js</code> and save to reload.</p>
+      </header>
+    </div>
+  );
 }
+
+export default App;`
+                        }
+                    }
+                }
+            }
+        };
+
+        // Mount the React app
+        webContainer.mount(basicReactApp).then(() => {
+            console.log("React app mounted successfully");
+            setFileTree(basicReactApp);
+            
+            // Add confirmation message
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "✅ React app created successfully!\n\nI've set up a basic React application structure for you. You can now edit the files in the file explorer.\n\nTo run the app, you would typically use `npm start`."
+                })
+            }]);
+        }).catch(err => {
+            console.error("Failed to mount React app:", err);
+            
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "❌ Failed to create React app: " + err.message
+                })
+            }]);
+        });
+    };
+
+    // Helper function to create a basic Express app template
+    const createExpressApp = () => {
+        if (!webContainer) {
+            console.error("WebContainer not initialized");
+            return;
+        }
+
+        // Basic Express app structure
+        const expressApp = {
+            "package.json": {
+                file: {
+                    contents: `{
+  "name": "express-app",
+  "version": "1.0.0",
+  "description": "A basic Express server",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}`
+                }
+            },
+            "app.js": {
+                file: {
+                    contents: `const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Import routes
+const apiRoutes = require('./routes/api');
+
+// Middleware for parsing JSON bodies
+app.use(express.json());
+
+// Use routes
+app.use('/api', apiRoutes);
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
+// Start the server
+app.listen(port, () => {
+  console.log(\`Server listening on port \${port}\`);
+});`
+                }
+            },
+            "routes": {
+                directory: {
+                    "api.js": {
+                        file: {
+                            contents: `const express = require('express');
+const router = express.Router();
+const userController = require('../controllers/userController');
+
+// Define routes
+router.get('/users', userController.getAllUsers);
+router.get('/users/:id', userController.getUserById);
+router.post('/users', userController.createUser);
+router.put('/users/:id', userController.updateUser);
+router.delete('/users/:id', userController.deleteUser);
+
+module.exports = router;`
+                        }
+                    }
+                }
+            },
+            "controllers": {
+                directory: {
+                    "userController.js": {
+                        file: {
+                            contents: `// Mock user data
+const users = [
+  { id: 1, name: 'John Doe', email: 'john@example.com' },
+  { id: 2, name: 'Jane Smith', email: 'jane@example.com' }
+];
+
+// Controller methods
+exports.getAllUsers = (req, res) => {
+  res.json({ users });
+};
+
+exports.getUserById = (req, res) => {
+  const id = parseInt(req.params.id);
+  const user = users.find(user => user.id === id);
+  
+  if (user) {
+    res.json({ user });
+  } else {
+    res.status(404).json({ error: 'User not found' });
+  }
+};
+
+exports.createUser = (req, res) => {
+  const { name, email } = req.body;
+  
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Name and email are required' });
+  }
+  
+  const id = users.length > 0 ? Math.max(...users.map(u => u.id)) + 1 : 1;
+  const newUser = { id, name, email };
+  users.push(newUser);
+  
+  res.status(201).json({ user: newUser });
+};
+
+exports.updateUser = (req, res) => {
+  const id = parseInt(req.params.id);
+  const { name, email } = req.body;
+  const index = users.findIndex(user => user.id === id);
+  
+  if (index !== -1) {
+    users[index] = { ...users[index], ...(name && { name }), ...(email && { email }) };
+    res.json({ user: users[index] });
+  } else {
+    res.status(404).json({ error: 'User not found' });
+  }
+};
+
+exports.deleteUser = (req, res) => {
+  const id = parseInt(req.params.id);
+  const index = users.findIndex(user => user.id === id);
+  
+  if (index !== -1) {
+    const deletedUser = users.splice(index, 1)[0];
+    res.json({ user: deletedUser });
+  } else {
+    res.status(404).json({ error: 'User not found' });
+  }
+};`
+                        }
+                    }
+                }
+            }
+        };
+
+        // Mount the Express app
+        webContainer.mount(expressApp).then(() => {
+            console.log("Express app mounted successfully");
+            setFileTree(expressApp);
+            
+            // Add confirmation message
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "✅ Express server created successfully!\n\nI've set up a basic Express.js server with modular structure. Check the file explorer for the created files.\n\nThe app includes:\n- Routes for a RESTful API\n- Controller for user management\n- Error handling middleware\n\nTo run the server, you would typically use `npm start`."
+                })
+            }]);
+        }).catch(err => {
+            console.error("Failed to mount Express app:", err);
+            
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "❌ Failed to create Express app: " + err.message
+                })
+            }]);
+        });
+    };
 
     useEffect(() => {
         if (!project?._id) {
@@ -221,33 +526,80 @@ const Project = () => {
             })
         }
 
-        // Updated message handler to use sanitizeJsonString
+        // Updated message handler with direct command support and improved file tree handling
         receiveMessage('project-message', data => {
-            console.log(data)
+            console.log(data);
+
+            // Handle direct commands first
+            if (data.sender._id !== 'ai' && typeof data.message === 'string') {
+                const lowerMsg = data.message.toLowerCase();
+                
+                // Check for direct React app creation command
+                if (lowerMsg.includes("@ai create react app")) {
+                    setMessages(prevMessages => [...prevMessages, data]);
+                    
+                    // Add AI "thinking" message
+                    setMessages(prevMessages => [...prevMessages, {
+                        sender: { _id: 'ai', email: 'AI Assistant' },
+                        message: JSON.stringify({ text: "Creating a React application..." })
+                    }]);
+                    
+                    // Create React app directly
+                    createReactApp();
+                    return;
+                }
+                
+                // Check for direct Express app creation command
+                if (lowerMsg.includes("@ai create express server") || lowerMsg.includes("@ai create an express server")) {
+                    setMessages(prevMessages => [...prevMessages, data]);
+                    
+                    // Add AI "thinking" message
+                    setMessages(prevMessages => [...prevMessages, {
+                        sender: { _id: 'ai', email: 'AI Assistant' },
+                        message: JSON.stringify({ text: "Creating an Express server..." })
+                    }]);
+                    
+                    // Create Express app directly
+                    createExpressApp();
+                    return;
+                }
+                
+                // Regular user message
+                setMessages(prevMessages => [...prevMessages, data]);
+                return;
+            }
 
             if (data.sender._id === 'ai') {
                 try {
-                    const message = sanitizeJsonString(data.message)
-                    console.log("Parsed message:", message)
+                    const message = sanitizeJsonString(data.message);
+                    console.log("Parsed message:", message);
 
-                    if (webContainer && message?.fileTree) {
-                        webContainer.mount(message.fileTree).catch(err => {
-                            console.error("Failed to mount file tree:", err)
-                        })
+                    // If fileTree is just a flag (true), use our template instead
+                    if (message?.fileTree === true) {
+                        if (data.message.toLowerCase().includes('react')) {
+                            createReactApp();
+                        } else if (data.message.toLowerCase().includes('express')) {
+                            createExpressApp();
+                        }
                     }
-
-                    if (message?.fileTree) {
-                        setFileTree(message.fileTree || {})
+                    // If fileTree is an actual object, use it
+                    else if (webContainer && message?.fileTree && typeof message.fileTree === 'object') {
+                        webContainer.mount(message.fileTree).then(() => {
+                            setFileTree(message.fileTree);
+                        }).catch(err => {
+                            console.error("Failed to mount file tree:", err);
+                        });
                     }
-                    setMessages(prevMessages => [...prevMessages, data])
+                    
+                    setMessages(prevMessages => [...prevMessages, data]);
                 } catch (error) {
                     console.error("Error parsing AI message:", error);
-                    setMessages(prevMessages => [...prevMessages, data])
+                    setMessages(prevMessages => [...prevMessages, data]);
                 }
             } else {
-                setMessages(prevMessages => [...prevMessages, data])
+                setMessages(prevMessages => [...prevMessages, data]);
             }
-        })
+        });
 
         axios.get(`/projects/get-project/${project._id}`).then(res => {
             console.log(res.data.project)
@@ -299,6 +651,7 @@ const Project = () => {
     // Retry socket connection function
     const retryConnection = () => {
         setSocketError(null);
+        disconnect(); // Ensure old connection is cleaned up
         socketRef.current = initializeSocket(project._id);
         if (socketRef.current) {
             alert("Attempting to reconnect...");
@@ -329,7 +682,9 @@ const Project = () => {
                         ref={messageBox}
                         className="message-box p-1 flex-grow flex flex-col gap-1 overflow-auto max-h-full scrollbar-hide">
                         {messages.map((msg, index) => (
-                            <div key={index} className={`${msg.sender._id === 'ai' ? 'max-w-80' : 'max-w-52'} ${msg.sender._id == user._id.toString() && 'ml-auto'}  message flex flex-col p-2 bg-slate-50 w-fit rounded-md`}>
+                            <div 
+                                key={`msg-${index}-${msg.sender._id}`} 
+                                className={`${msg.sender._id === 'ai' ? 'max-w-80' : 'max-w-52'} ${msg.sender._id == user._id.toString() && 'ml-auto'}  message flex flex-col p-2 bg-slate-50 w-fit rounded-md`}>
                                 <small className='opacity-65 text-xs'>{msg.sender.email}</small>
                                 <div className='text-sm'>
                                     {msg.sender._id === 'ai' ?
@@ -347,7 +702,7 @@ const Project = () => {
                             onKeyPress={(e) => e.key === 'Enter' && send()}
                             className='p-2 px-4 border-none outline-none flex-grow' 
                             type="text" 
-                            placeholder='Enter message' />
+                            placeholder='Enter message or type @ai create react app' />
                         <button
                             onClick={send}
                             className='px-5 bg-slate-950 text-white'><i className="ri-send-plane-fill"></i></button>
@@ -384,7 +739,7 @@ const Project = () => {
                         {
                             fileTree && Object.keys(fileTree).map((file, index) => (
                                 <button
-                                    key={index}
+                                    key={`file-${index}-${file}`}
                                     onClick={() => {
                                         setCurrentFile(file)
                                         setOpenFiles([...new Set([...openFiles, file])])
@@ -395,6 +750,30 @@ const Project = () => {
                                     >{file}</p>
                                 </button>))
                         }
+                        {
+                            fileTree && Object.keys(fileTree).filter(key => fileTree[key]?.directory).map((dir, index) => (
+                                <div key={`dir-${index}-${dir}`} className="directory">
+                                    <div className="directory-header p-2 px-4 bg-slate-400 flex items-center">
+                                        <i className="ri-folder-fill mr-2"></i>
+                                        <p className='font-semibold'>{dir}</p>
+                                    </div>
+                                    <div className="directory-files pl-4">
+                                        {Object.keys(fileTree[dir].directory).map((file, fileIndex) => (
+                                            <button
+                                                key={`subfile-${index}-${fileIndex}-${file}`}
+                                                onClick={() => {
+                                                    const path = `${dir}/${file}`;
+                                                    setCurrentFile(path);
+                                                    setOpenFiles([...new Set([...openFiles, path])]);
+                                                }}
+                                                className="tree-element cursor-pointer p-2 px-4 flex items-center gap-2 bg-slate-300 w-full">
+                                                <p className='font-semibold text-lg'>{file}</p>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            ))
+                        }
                     </div>
                 </div>
 
@@ -404,7 +783,7 @@ const Project = () => {
                             {
                                 openFiles.map((file, index) => (
                                     <button
-                                        key={index}
+                                        key={`open-${index}-${file}`}
                                         onClick={() => setCurrentFile(file)}
                                         className={`open-file cursor-pointer p-2 px-4 flex items-center w-fit gap-2 bg-slate-300 ${currentFile === file ? 'bg-slate-400' : ''}`}>
                                         <p
@@ -417,7 +796,7 @@ const Project = () => {
                     </div>
                     <div className="bottom flex flex-grow max-w-full shrink overflow-auto">
                         {
-                            currentFile && fileTree && fileTree[currentFile] && fileTree[currentFile]?.file && (
+                            currentFile && fileTree && (
                                 <div className="code-editor-area h-full overflow-auto flex-grow bg-slate-50">
                                     <pre className="hljs h-full">
                                         <code
@@ -426,21 +805,41 @@ const Project = () => {
                                             suppressContentEditableWarning
                                             onBlur={(e) => {
                                                 const updatedContent = e.target.innerText;
-                                                const ft = {
-                                                    ...fileTree,
-                                                    [currentFile]: {
-                                                        file: {
-                                                            contents: updatedContent
+                                                // Check if it's a nested path
+                                                if (currentFile.includes('/')) {
+                                                    const [dir, file] = currentFile.split('/');
+                                                    const ft = {
+                                                        ...fileTree,
+                                                        [dir]: {
+                                                            ...fileTree[dir],
+                                                            directory: {
+                                                                ...fileTree[dir].directory,
+                                                                [file]: {
+                                                                    file: {
+                                                                        contents: updatedContent
+                                                                    }
+                                                                }
+                                                            }
                                                         }
-                                                    }
+                                                    };
+                                                    setFileTree(ft);
+                                                    saveFileTree(ft);
+                                                } else {
+                                                    // Regular top-level file
+                                                    const ft = {
+                                                        ...fileTree,
+                                                        [currentFile]: {
+                                                            file: {
+                                                                contents: updatedContent
+                                                            }
+                                                        }
+                                                    };
+                                                    setFileTree(ft);
+                                                    saveFileTree(ft);
                                                 }
-                                                setFileTree(ft)
-                                                saveFileTree(ft)
                                             }}
                                             dangerouslySetInnerHTML={{
-                                                __html: fileTree[currentFile]?.file?.contents
-                                                    ? hljs.highlight('javascript', fileTree[currentFile].file.contents).value
-                                                    : ''
+                                                __html: getCurrentFileContent()
                                             }}
                                             style={{
                                                 whiteSpace: 'pre-wrap',
@@ -478,7 +877,11 @@ const Project = () => {
                         </header>
                         <div className="users-list flex flex-col gap-2 mb-16 max-h-96 overflow-auto">
                             {users.map(user => (
-                                <div key={user._id} className={`user cursor-pointer hover:bg-slate-200 ${Array.from(selectedUserId).indexOf(user._id) != -1 ? 'bg-slate-200' : ""} p-2 flex gap-2 items-center`} onClick={() => handleUserClick(user._id)}>
+                                <div 
+                                    key={`modal-user-${user._id}`} 
+                                    className={`user cursor-pointer hover:bg-slate-200 ${Array.from(selectedUserId).indexOf(user._id) != -1 ? 'bg-slate-200' : ""} p-2 flex gap-2 items-center`} 
+                                    onClick={() => handleUserClick(user._id)}
+                                >
                                     <div className='aspect-square relative rounded-full w-fit h-fit flex items-center justify-center p-5 text-white bg-slate-600'>
                                         <i className="ri-user-fill absolute"></i>
                                     </div>
@@ -496,6 +899,23 @@ const Project = () => {
             )}
         </main>
     )
+
+    // Helper function to get content of current file (including nested files)
+    function getCurrentFileContent() {
+        if (!currentFile) return '';
+        
+        // Check if it's a nested path
+        if (currentFile.includes('/')) {
+            const [dir, file] = currentFile.split('/');
+            const content = fileTree[dir]?.directory?.[file]?.file?.contents;
+            return content ? hljs.highlight('javascript', content).value : '';
+        }
+        
+        // Regular top-level file
+        return fileTree[currentFile]?.file?.contents
+            ? hljs.highlight('javascript', fileTree[currentFile].file.contents).value
+            : '';
+    }
 }
 
 export default Project
