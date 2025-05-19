@@ -4,8 +4,10 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import axios from '../config/axios'
 import { initializeSocket, receiveMessage, sendMessage, disconnect } from '../config/socket'
 import Markdown from 'markdown-to-jsx'
-import hljs from 'highlight.js';
-import { getWebContainer } from '../config/webcontainer'
+// Import highlight.js with styles to fix the CDN loading issue
+import hljs from 'highlight.js'
+import 'highlight.js/styles/github-dark.css' // Import a style directly
+import { getWebContainer } from '../config/Container' // Make sure the casing matches the actual file
 import PropTypes from 'prop-types'
 
 function sanitizeJsonString(jsonString) {
@@ -77,8 +79,9 @@ function SyntaxHighlightedCode(props) {
     const ref = useRef(null)
 
     React.useEffect(() => {
-        if (ref.current && props.className?.includes('lang-') && window.hljs) {
-            window.hljs.highlightElement(ref.current)
+        if (ref.current && props.className?.includes('lang-')) {
+            // Use the imported hljs directly instead of window.hljs
+            hljs.highlightElement(ref.current)
 
             // hljs won't reprocess the element unless this attribute is removed
             ref.current.removeAttribute('data-highlighted')
@@ -115,6 +118,7 @@ const Project = () => {
 
     const [webContainer, setWebContainer] = useState(null)
     const [iframeUrl, setIframeUrl] = useState(null)
+    const [isWebContainerLoading, setIsWebContainerLoading] = useState(false)
 
     const [runProcess, setRunProcess] = useState(null)
 
@@ -209,7 +213,23 @@ const Project = () => {
 
     // Helper function to create a basic React app template
     const createReactApp = () => {
+        if (isWebContainerLoading) {
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "⏳ WebContainer is still initializing. Please wait a moment..."
+                })
+            }]);
+            return;
+        }
+        
         if (!webContainer) {
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "❌ WebContainer is not available. Please refresh the page and try again."
+                })
+            }]);
             console.error("WebContainer not initialized");
             return;
         }
@@ -334,7 +354,23 @@ export default App;`
 
     // Helper function to create a basic Express app template
     const createExpressApp = () => {
+        if (isWebContainerLoading) {
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "⏳ WebContainer is still initializing. Please wait a moment..."
+                })
+            }]);
+            return;
+        }
+        
         if (!webContainer) {
+            setMessages(prevMessages => [...prevMessages, {
+                sender: { _id: 'ai', email: 'AI Assistant' },
+                message: JSON.stringify({
+                    text: "❌ WebContainer is not available. Please refresh the page and try again."
+                })
+            }]);
             console.error("WebContainer not initialized");
             return;
         }
@@ -517,14 +553,35 @@ exports.deleteUser = (req, res) => {
             return;
         }
 
-        if (!webContainer) {
-            getWebContainer().then(container => {
-                setWebContainer(container)
-                console.log("container started")
-            }).catch(err => {
-                console.error("Failed to start webcontainer:", err)
-            })
-        }
+        // Modified for safe WebContainer initialization with loading state
+        let isMounted = true;
+        
+        const initWebContainer = async () => {
+            if (typeof window === 'undefined') return;
+            
+            try {
+                setIsWebContainerLoading(true);
+                console.log("Initializing WebContainer...");
+                const container = await getWebContainer();
+                
+                if (isMounted) {
+                    if (container) {
+                        setWebContainer(container);
+                        console.log("WebContainer mounted successfully");
+                    } else {
+                        console.error("WebContainer initialization returned null");
+                    }
+                    setIsWebContainerLoading(false);
+                }
+            } catch (error) {
+                console.error("Error initializing WebContainer:", error);
+                if (isMounted) {
+                    setIsWebContainerLoading(false);
+                }
+            }
+        };
+        
+        initWebContainer();
 
         // Updated message handler with direct command support and improved file tree handling
         receiveMessage('project-message', data => {
@@ -618,6 +675,7 @@ exports.deleteUser = (req, res) => {
         // Cleanup function
         return () => {
             disconnect();
+            isMounted = false;
         };
     }, [project._id])
 
@@ -677,13 +735,19 @@ exports.deleteUser = (req, res) => {
                             <button onClick={retryConnection} className="underline">Retry</button>
                         </div>
                     )}
+
+                    {isWebContainerLoading && (
+                        <div className="webcontainer-loading bg-blue-100 border-l-4 border-blue-500 text-blue-700 p-3 mb-2">
+                            <p>Initializing WebContainer environment...</p>
+                        </div>
+                    )}
                     
                     <div
                         ref={messageBox}
                         className="message-box p-1 flex-grow flex flex-col gap-1 overflow-auto max-h-full scrollbar-hide">
                         {messages.map((msg, index) => (
                             <div 
-                                key={`msg-${index}-${msg.sender._id}`} 
+                                key={`msg-${index}-${msg.sender._id}-${Date.now()}`} 
                                 className={`${msg.sender._id === 'ai' ? 'max-w-80' : 'max-w-52'} ${msg.sender._id == user._id.toString() && 'ml-auto'}  message flex flex-col p-2 bg-slate-50 w-fit rounded-md`}>
                                 <small className='opacity-65 text-xs'>{msg.sender.email}</small>
                                 <div className='text-sm'>
@@ -739,7 +803,7 @@ exports.deleteUser = (req, res) => {
                         {
                             fileTree && Object.keys(fileTree).map((file, index) => (
                                 <button
-                                    key={`file-${index}-${file}`}
+                                    key={`file-${file}-${index}`}
                                     onClick={() => {
                                         setCurrentFile(file)
                                         setOpenFiles([...new Set([...openFiles, file])])
@@ -752,7 +816,7 @@ exports.deleteUser = (req, res) => {
                         }
                         {
                             fileTree && Object.keys(fileTree).filter(key => fileTree[key]?.directory).map((dir, index) => (
-                                <div key={`dir-${index}-${dir}`} className="directory">
+                                <div key={`dir-${dir}-${index}`} className="directory">
                                     <div className="directory-header p-2 px-4 bg-slate-400 flex items-center">
                                         <i className="ri-folder-fill mr-2"></i>
                                         <p className='font-semibold'>{dir}</p>
@@ -760,7 +824,7 @@ exports.deleteUser = (req, res) => {
                                     <div className="directory-files pl-4">
                                         {Object.keys(fileTree[dir].directory).map((file, fileIndex) => (
                                             <button
-                                                key={`subfile-${index}-${fileIndex}-${file}`}
+                                                key={`subfile-${dir}-${file}-${fileIndex}`}
                                                 onClick={() => {
                                                     const path = `${dir}/${file}`;
                                                     setCurrentFile(path);
@@ -783,7 +847,7 @@ exports.deleteUser = (req, res) => {
                             {
                                 openFiles.map((file, index) => (
                                     <button
-                                        key={`open-${index}-${file}`}
+                                        key={`open-${file}-${index}`}
                                         onClick={() => setCurrentFile(file)}
                                         className={`open-file cursor-pointer p-2 px-4 flex items-center w-fit gap-2 bg-slate-300 ${currentFile === file ? 'bg-slate-400' : ''}`}>
                                         <p
@@ -904,17 +968,51 @@ exports.deleteUser = (req, res) => {
     function getCurrentFileContent() {
         if (!currentFile) return '';
         
-        // Check if it's a nested path
-        if (currentFile.includes('/')) {
-            const [dir, file] = currentFile.split('/');
-            const content = fileTree[dir]?.directory?.[file]?.file?.contents;
-            return content ? hljs.highlight('javascript', content).value : '';
+        try {
+            // Check if it's a nested path
+            if (currentFile.includes('/')) {
+                const [dir, file] = currentFile.split('/');
+                const content = fileTree[dir]?.directory?.[file]?.file?.contents;
+                
+                // Use safe highlight if available, or return raw content
+                if (content && typeof hljs.highlight === 'function') {
+                    try {
+                        // Determine language from file extension
+                        const fileExt = file.split('.').pop()?.toLowerCase()
+                        const language = fileExt === 'js' || fileExt === 'jsx' ? 'javascript' :
+                                         fileExt === 'css' ? 'css' : 
+                                         fileExt === 'html' ? 'html' : 'javascript'
+                        
+                        return hljs.highlight(content, {language}).value;
+                    } catch (e) {
+                        console.error("Error highlighting nested file:", e);
+                        return content;
+                    }
+                }
+                return content || '';
+            }
+            
+            // Regular top-level file
+            const content = fileTree[currentFile]?.file?.contents;
+            if (content && typeof hljs.highlight === 'function') {
+                try {
+                    // Determine language from file extension
+                    const fileExt = currentFile.split('.').pop()?.toLowerCase()
+                    const language = fileExt === 'js' || fileExt === 'jsx' ? 'javascript' :
+                                     fileExt === 'css' ? 'css' : 
+                                     fileExt === 'html' ? 'html' : 'javascript'
+                    
+                    return hljs.highlight(content, {language}).value;
+                } catch (e) {
+                    console.error("Error highlighting file:", e);
+                    return content;
+                }
+            }
+            return content || '';
+        } catch (error) {
+            console.error("Error in getCurrentFileContent:", error);
+            return fileTree[currentFile]?.file?.contents || '';
         }
-        
-        // Regular top-level file
-        return fileTree[currentFile]?.file?.contents
-            ? hljs.highlight('javascript', fileTree[currentFile].file.contents).value
-            : '';
     }
 }
 
